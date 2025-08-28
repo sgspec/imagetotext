@@ -1,145 +1,157 @@
+// server.js
 import express from "express";
 import cors from "cors";
-import dotenv from "dotenv";
 import multer from "multer";
 
-dotenv.config();
+// --- Config ---
+const PORT = process.env.PORT || 10000;
+const AZURE_ENDPOINT = (process.env.AZURE_VISION_ENDPOINT || "").replace(/\/+$/, ""); // ตัด / ท้าย
+const AZURE_KEY = process.env.AZURE_VISION_KEY;
 
-const app = express();
-app.use(cors());                   // อนุญาต front-end เรียกได้
-app.use(express.json({ limit: "10mb" })); // เผื่อรับ base64
-const upload = multer();           // ใช้รับไฟล์แบบ multipart/form-data
-
-const ENDPOINT = process.env.AZURE_VISION_ENDPOINT?.replace(/\/+$/, "") || "";
-const KEY = process.env.AZURE_VISION_KEY;
-
-if (!ENDPOINT || !KEY) {
-  console.error("Missing AZURE_VISION_ENDPOINT or AZURE_VISION_KEY");
+if (!AZURE_ENDPOINT || !AZURE_KEY) {
+  console.error("❌ Missing AZURE_VISION_ENDPOINT or AZURE_VISION_KEY");
   process.exit(1);
 }
 
-// ฟังก์ชันเรียก Read API (แบบ URL ของรูป)
-async function readFromImageUrl(imageUrl, language = "th") {
-  const analyzeUrl = `${ENDPOINT}/vision/v3.2/read/analyze?language=${encodeURIComponent(language)}`;
+// ใช้ Read API v3.2
+const READ_ANALYZE_URL = `${AZURE_ENDPOINT}/vision/v3.2/read/analyze`;
 
-  const res = await fetch(analyzeUrl, {
-    method: "POST",
-    headers: {
-      "Ocp-Apim-Subscription-Key": KEY,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({ url: imageUrl })
-  });
+const app = express();
+app.use(cors());
+app.use(express.json({ limit: "10mb" }));
 
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Analyze failed: ${res.status} ${text}`);
-  }
+// รับไฟล์ด้วย memory storage (ไม่เขียนลงดิสก์)
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB
+  fileFilter: (req, file, cb) => {
+    const ok = /image\/(png|jpeg|jpg|gif|bmp|tiff|webp)/i.test(file.mimetype);
+    if (!ok) return cb(new Error("Unsupported file type"));
+    cb(null, true);
+  },
+});
 
-  const opLocation = res.headers.get("operation-location");
-  if (!opLocation) throw new Error("No Operation-Location header");
+// Helper: หน่วงเวลา
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-  // poll จนเสร็จ
-  let result;
-  for (let i = 0; i < 20; i++) {    // ลองรอได้ถึง ~20 วิ
-    await new Promise(r => setTimeout(r, 1000));
-    const poll = await fetch(opLocation, {
-      headers: { "Ocp-Apim-Subscription-Key": KEY }
-    });
-    result = await poll.json();
-    if (result.status && result.status !== "running" && result.status !== "notStarted") break;
-  }
-
-  if (!result?.analyzeResult) {
-    throw new Error(`No analyzeResult. Status: ${result?.status || "unknown"}`);
-  }
-
-  // รวมบรรทัดเป็นข้อความธรรมดา
-  const lines = [];
-  for (const readRes of result.analyzeResult.readResults || []) {
-    for (const line of readRes.lines || []) lines.push(line.text);
-  }
-
-  return {
-    status: result.status,
-    text: lines.join("\n"),
-    raw: result
-  };
+// Helper: ดึงข้อความจากผลลัพธ์ Read API (รองรับโครงสร้างเก่า/ใหม่)
+function extractText(resultJson) {
+  try {
+    // v3.2: analyzeResult.readResults[n].lines[].text
+    const rr = resultJson.analyzeResult?.readResults;
+    if (Array.isArray(rr)) {
+      const lines = rr.flatMap((p) => (p.lines || []).map((l) => l.text));
+      return lines.join("\n").trim();
+    }
+    // เผื่อโครงสร้างใหม่ (pages/blocks/lines)
+    const pages = resultJson.analyzeResult?.pages;
+    if (Array.isArray(pages)) {
+      const lines = pages.flatMap((p) =>
+        (p.lines || []).map((l) => (typeof l.content === "string" ? l.content : l.text || ""))
+      );
+      return lines.join("\n").trim();
+    }
+  } catch (_) {}
+  return "";
 }
 
-// ฟังก์ชันเรียก Read API (แบบอัปโหลดไฟล์ image binary)
-async function readFromUploadedFile(buffer, language = "th") {
-  const analyzeUrl = `${ENDPOINT}/vision/v3.2/read/analyze?language=${encodeURIComponent(language)}`;
-
-  const res = await fetch(analyzeUrl, {
+// Helper: โพสต์ภาพ (URL) ไป Read API
+async function submitImageUrl(imageUrl) {
+  const res = await fetch(READ_ANALYZE_URL, {
     method: "POST",
     headers: {
-      "Ocp-Apim-Subscription-Key": KEY,
-      "Content-Type": "application/octet-stream"
+      "Ocp-Apim-Subscription-Key": AZURE_KEY,
+      "Content-Type": "application/json",
     },
-    body: buffer
+    // ❌ ไม่ส่ง language → ให้ Azure auto-detect
+    body: JSON.stringify({ url: imageUrl }),
   });
-
   if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Analyze failed: ${res.status} ${text}`);
+    const t = await res.text().catch(() => "");
+    throw new Error(`Analyze (url) failed: ${res.status} ${t}`);
   }
+  const opLoc = res.headers.get("operation-location");
+  if (!opLoc) throw new Error("Missing operation-location header");
+  return opLoc;
+}
 
-  const opLocation = res.headers.get("operation-location");
-  if (!opLocation) throw new Error("No Operation-Location header");
+// Helper: โพสต์ภาพ (binary) ไป Read API
+async function submitImageBuffer(buffer) {
+  const res = await fetch(READ_ANALYZE_URL, {
+    method: "POST",
+    headers: {
+      "Ocp-Apim-Subscription-Key": AZURE_KEY,
+      "Content-Type": "application/octet-stream",
+    },
+    body: buffer,
+  });
+  if (!res.ok) {
+    const t = await res.text().catch(() => "");
+    throw new Error(`Analyze (upload) failed: ${res.status} ${t}`);
+  }
+  const opLoc = res.headers.get("operation-location");
+  if (!opLoc) throw new Error("Missing operation-location header");
+  return opLoc;
+}
 
-  let result;
-  for (let i = 0; i < 20; i++) {
-    await new Promise(r => setTimeout(r, 1000));
-    const poll = await fetch(opLocation, {
-      headers: { "Ocp-Apim-Subscription-Key": KEY }
+// Helper: poll จนกว่าจะได้ผลลัพธ์
+async function pollResult(operationLocation, { timeoutMs = 30000, intervalMs = 1200 } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const res = await fetch(operationLocation, {
+      headers: { "Ocp-Apim-Subscription-Key": AZURE_KEY },
     });
-    result = await poll.json();
-    if (result.status && result.status !== "running" && result.status !== "notStarted") break;
+    if (!res.ok) {
+      const t = await res.text().catch(() => "");
+      throw new Error(`Poll failed: ${res.status} ${t}`);
+    }
+    const data = await res.json();
+    const status = data.status?.toLowerCase();
+    if (status === "succeeded") return data;
+    if (status === "failed") throw new Error(`Analyze failed: ${res.status} ${JSON.stringify(data)}`);
+    await sleep(intervalMs);
   }
-
-  if (!result?.analyzeResult) {
-    throw new Error(`No analyzeResult. Status: ${result?.status || "unknown"}`);
-  }
-
-  const lines = [];
-  for (const readRes of result.analyzeResult.readResults || []) {
-    for (const line of readRes.lines || []) lines.push(line.text);
-  }
-
-  return {
-    status: result.status,
-    text: lines.join("\n"),
-    raw: result
-  };
+  throw new Error("Polling timed out");
 }
 
 // --- Routes ---
-// 1) ส่ง URL ของรูป
+
+// 1) ส่ง URL รูป
 app.post("/ocr/url", async (req, res) => {
   try {
-    const { imageUrl, language = "th" } = req.body || {};
+    const { imageUrl } = req.body || {};
     if (!imageUrl) return res.status(400).json({ error: "imageUrl is required" });
-    const out = await readFromImageUrl(imageUrl, language);
-    res.json(out);
-  } catch (e) {
-    res.status(500).json({ error: String(e.message || e) });
+
+    const opLoc = await submitImageUrl(imageUrl);
+    const result = await pollResult(opLoc);
+    const text = extractText(result);
+    res.json({ status: "succeeded", text, raw: result });
+  } catch (err) {
+    console.error(err);
+    res.status(400).json({ error: String(err.message || err) });
   }
 });
 
-// 2) อัปโหลดไฟล์รูป (multipart/form-data, field name = "file")
+// 2) อัปโหลดไฟล์รูป
 app.post("/ocr/upload", upload.single("file"), async (req, res) => {
   try {
     if (!req.file?.buffer) return res.status(400).json({ error: "file is required" });
-    const { language = "th" } = req.body || {};
-    const out = await readFromUploadedFile(req.file.buffer, language);
-    res.json(out);
-  } catch (e) {
-    res.status(500).json({ error: String(e.message || e) });
+
+    const opLoc = await submitImageBuffer(req.file.buffer);
+    const result = await pollResult(opLoc);
+    const text = extractText(result);
+    res.json({ status: "succeeded", text, raw: result });
+  } catch (err) {
+    console.error(err);
+    res.status(400).json({ error: String(err.message || err) });
   }
 });
 
-const port = process.env.PORT || 10000;
-app.listen(port, () => {
-  console.log(`OCR server running on :${port}`);
+// health check
+app.get("/", (_req, res) => {
+  res.send("Azure Read OCR backend is running.");
+});
+
+app.listen(PORT, () => {
+  console.log(`✅ Server listening on port ${PORT}`);
 });
