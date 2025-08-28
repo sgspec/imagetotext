@@ -1,94 +1,69 @@
-// server.js
 import express from "express";
-import cors from "cors";
+import fetch from "node-fetch";
 import multer from "multer";
-
-const PORT = process.env.PORT || 10000;
-const AZURE_ENDPOINT = (process.env.AZURE_VISION_ENDPOINT || "").replace(/\/+$/, "");
-const AZURE_KEY = process.env.AZURE_VISION_KEY;
-
-if (!AZURE_ENDPOINT || !AZURE_KEY) {
-  console.error("❌ Missing AZURE_VISION_ENDPOINT or AZURE_VISION_KEY");
-  process.exit(1);
-}
-
-// Document Intelligence OCR (prebuilt-read)
-const OCR_URL = `${AZURE_ENDPOINT}/formrecognizer/documentModels/prebuilt-read:analyze?api-version=2023-07-31`;
+import fs from "fs";
 
 const app = express();
-app.use(cors());
-app.use(express.json({ limit: "10mb" }));
+const upload = multer({ dest: "uploads/" });
 
-const upload = multer({ storage: multer.memoryStorage() });
+const AZURE_ENDPOINT = process.env.AZURE_VISION_ENDPOINT; 
+const AZURE_KEY = process.env.AZURE_VISION_KEY;
 
-// helper extract text
-function extractText(resultJson) {
-  const chunks = [];
-  try {
-    const pages = resultJson.analyzeResult?.pages || [];
-    for (const p of pages) {
-      for (const line of p.lines || []) {
-        if (line.content) chunks.push(line.content);
-      }
-    }
-  } catch (e) {
-    console.error("extractText error", e);
-  }
-  return chunks.join("\n").trim();
-}
+app.use(express.json());
 
-// === Routes ===
-
-// OCR from URL
+// OCR by image URL
 app.post("/ocr/url", async (req, res) => {
   try {
     const { imageUrl } = req.body;
-    if (!imageUrl) return res.status(400).json({ error: "imageUrl required" });
+    const url = `${AZURE_ENDPOINT}/formrecognizer/documentModels/prebuilt-read:analyze?api-version=2023-07-31`;
 
-    const response = await fetch(OCR_URL, {
+    const response = await fetch(url, {
       method: "POST",
       headers: {
-        "Ocp-Apim-Subscription-Key": AZURE_KEY,
         "Content-Type": "application/json",
+        "Ocp-Apim-Subscription-Key": AZURE_KEY,
       },
-      body: JSON.stringify({ urlSource: imageUrl }),
+      body: JSON.stringify({ urlSource: imageUrl })
     });
 
-    if (!response.ok) {
-      return res.status(400).json({ error: await response.text() });
-    }
-    const data = await response.json();
-    res.json({ status: "succeeded", text: extractText(data), raw: data });
+    const result = await response.json();
+    const text = result.analyzeResult?.content || "";
+
+    res.json({ text, raw: result });
   } catch (err) {
-    res.status(500).json({ error: String(err) });
+    console.error(err);
+    res.status(500).json({ error: err.message });
   }
 });
 
-// OCR from file upload
+// OCR by file upload
 app.post("/ocr/upload", upload.single("file"), async (req, res) => {
   try {
-    if (!req.file?.buffer) return res.status(400).json({ error: "file required" });
+    const filePath = req.file.path;
+    const url = `${AZURE_ENDPOINT}/formrecognizer/documentModels/prebuilt-read:analyze?api-version=2023-07-31`;
 
-    const response = await fetch(OCR_URL, {
+    const imgData = fs.readFileSync(filePath);
+
+    const response = await fetch(url, {
       method: "POST",
       headers: {
-        "Ocp-Apim-Subscription-Key": AZURE_KEY,
         "Content-Type": "application/octet-stream",
+        "Ocp-Apim-Subscription-Key": AZURE_KEY,
       },
-      body: req.file.buffer,
+      body: imgData
     });
 
-    if (!response.ok) {
-      return res.status(400).json({ error: await response.text() });
-    }
-    const data = await response.json();
-    res.json({ status: "succeeded", text: extractText(data), raw: data });
+    const result = await response.json();
+    const text = result.analyzeResult?.content || "";
+
+    res.json({ text, raw: result });
+
+    fs.unlinkSync(filePath); // ลบไฟล์หลังใช้งาน
   } catch (err) {
-    res.status(500).json({ error: String(err) });
+    console.error(err);
+    res.status(500).json({ error: err.message });
   }
 });
 
-// health check
-app.get("/", (_, res) => res.send("✅ Document Intelligence OCR backend running"));
-
+const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
