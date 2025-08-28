@@ -1,4 +1,4 @@
-// server.js — ESM + ใช้ fetch ที่มากับ Node (ไม่ต้องลง node-fetch)
+// server.js (with polling)
 import express from "express";
 import cors from "cors";
 import multer from "multer";
@@ -18,17 +18,36 @@ if (!AZURE_ENDPOINT || !AZURE_KEY) {
   process.exit(1);
 }
 
-// Document Intelligence (Form Recognizer) prebuilt-read
+// Document Intelligence OCR endpoint
 const OCR_URL = `${AZURE_ENDPOINT}/formrecognizer/documentModels/prebuilt-read:analyze?api-version=2023-07-31`;
 
 function extractText(diJson) {
   const pages = diJson?.analyzeResult?.pages || [];
   const lines = [];
-  for (const p of pages) for (const ln of p.lines || []) if (ln.content) lines.push(ln.content);
+  for (const p of pages) {
+    for (const ln of p.lines || []) {
+      if (ln.content) lines.push(ln.content);
+    }
+  }
   return lines.join("\n").trim();
 }
 
-// 1) จาก URL
+// Polling function
+async function pollResult(resultUrl) {
+  while (true) {
+    const r = await fetch(resultUrl, {
+      headers: { "Ocp-Apim-Subscription-Key": AZURE_KEY }
+    });
+    const data = await r.json();
+
+    if (data.status === "succeeded" || data.status === "failed") {
+      return data;
+    }
+    await new Promise((res) => setTimeout(res, 1500)); // wait 1.5s
+  }
+}
+
+// ---- OCR จาก URL ----
 app.post("/ocr/url", async (req, res) => {
   try {
     const { imageUrl } = req.body || {};
@@ -43,8 +62,12 @@ app.post("/ocr/url", async (req, res) => {
       body: JSON.stringify({ urlSource: imageUrl })
     });
 
-    const data = await r.json().catch(() => ({}));
-    if (!r.ok) return res.status(400).json({ error: data });
+    if (!r.ok) {
+      return res.status(400).json(await r.text());
+    }
+
+    const opLoc = r.headers.get("operation-location");
+    const data = await pollResult(opLoc);
 
     res.json({ status: "succeeded", text: extractText(data), raw: data });
   } catch (e) {
@@ -52,7 +75,7 @@ app.post("/ocr/url", async (req, res) => {
   }
 });
 
-// 2) อัปโหลดไฟล์
+// ---- OCR จากไฟล์ ----
 app.post("/ocr/upload", upload.single("file"), async (req, res) => {
   try {
     if (!req.file?.path) return res.status(400).json({ error: "file required" });
@@ -67,18 +90,21 @@ app.post("/ocr/upload", upload.single("file"), async (req, res) => {
       body: buf
     });
 
-    const data = await r.json().catch(() => ({}));
-    if (!r.ok) return res.status(400).json({ error: data });
+    if (!r.ok) {
+      return res.status(400).json(await r.text());
+    }
+
+    const opLoc = r.headers.get("operation-location");
+    const data = await pollResult(opLoc);
 
     res.json({ status: "succeeded", text: extractText(data), raw: data });
   } catch (e) {
     res.status(500).json({ error: String(e) });
   } finally {
-    // ลบไฟล์ทิ้ง
     try { if (req.file?.path) fs.unlinkSync(req.file.path); } catch {}
   }
 });
 
-app.get("/", (_, res) => res.send("✅ Document Intelligence OCR backend running"));
+app.get("/", (_, res) => res.send("✅ OCR Backend running with polling"));
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log("🚀 Server running on", PORT));
