@@ -1,69 +1,84 @@
+// server.js — ESM + ใช้ fetch ที่มากับ Node (ไม่ต้องลง node-fetch)
 import express from "express";
-import fetch from "node-fetch";
+import cors from "cors";
 import multer from "multer";
 import fs from "fs";
 
 const app = express();
+app.use(cors());
+app.use(express.json({ limit: "10mb" }));
+
 const upload = multer({ dest: "uploads/" });
 
-const AZURE_ENDPOINT = process.env.AZURE_VISION_ENDPOINT; 
+const AZURE_ENDPOINT = (process.env.AZURE_VISION_ENDPOINT || "").replace(/\/+$/, "");
 const AZURE_KEY = process.env.AZURE_VISION_KEY;
 
-app.use(express.json());
+if (!AZURE_ENDPOINT || !AZURE_KEY) {
+  console.error("❌ Missing AZURE_VISION_ENDPOINT or AZURE_VISION_KEY");
+  process.exit(1);
+}
 
-// OCR by image URL
+// Document Intelligence (Form Recognizer) prebuilt-read
+const OCR_URL = `${AZURE_ENDPOINT}/formrecognizer/documentModels/prebuilt-read:analyze?api-version=2023-07-31`;
+
+function extractText(diJson) {
+  const pages = diJson?.analyzeResult?.pages || [];
+  const lines = [];
+  for (const p of pages) for (const ln of p.lines || []) if (ln.content) lines.push(ln.content);
+  return lines.join("\n").trim();
+}
+
+// 1) จาก URL
 app.post("/ocr/url", async (req, res) => {
   try {
-    const { imageUrl } = req.body;
-    const url = `${AZURE_ENDPOINT}/formrecognizer/documentModels/prebuilt-read:analyze?api-version=2023-07-31`;
+    const { imageUrl } = req.body || {};
+    if (!imageUrl) return res.status(400).json({ error: "imageUrl required" });
 
-    const response = await fetch(url, {
+    const r = await fetch(OCR_URL, {
       method: "POST",
       headers: {
-        "Content-Type": "application/json",
         "Ocp-Apim-Subscription-Key": AZURE_KEY,
+        "Content-Type": "application/json"
       },
       body: JSON.stringify({ urlSource: imageUrl })
     });
 
-    const result = await response.json();
-    const text = result.analyzeResult?.content || "";
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) return res.status(400).json({ error: data });
 
-    res.json({ text, raw: result });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: err.message });
+    res.json({ status: "succeeded", text: extractText(data), raw: data });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
   }
 });
 
-// OCR by file upload
+// 2) อัปโหลดไฟล์
 app.post("/ocr/upload", upload.single("file"), async (req, res) => {
   try {
-    const filePath = req.file.path;
-    const url = `${AZURE_ENDPOINT}/formrecognizer/documentModels/prebuilt-read:analyze?api-version=2023-07-31`;
+    if (!req.file?.path) return res.status(400).json({ error: "file required" });
+    const buf = fs.readFileSync(req.file.path);
 
-    const imgData = fs.readFileSync(filePath);
-
-    const response = await fetch(url, {
+    const r = await fetch(OCR_URL, {
       method: "POST",
       headers: {
-        "Content-Type": "application/octet-stream",
         "Ocp-Apim-Subscription-Key": AZURE_KEY,
+        "Content-Type": "application/octet-stream"
       },
-      body: imgData
+      body: buf
     });
 
-    const result = await response.json();
-    const text = result.analyzeResult?.content || "";
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) return res.status(400).json({ error: data });
 
-    res.json({ text, raw: result });
-
-    fs.unlinkSync(filePath); // ลบไฟล์หลังใช้งาน
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: err.message });
+    res.json({ status: "succeeded", text: extractText(data), raw: data });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  } finally {
+    // ลบไฟล์ทิ้ง
+    try { if (req.file?.path) fs.unlinkSync(req.file.path); } catch {}
   }
 });
 
+app.get("/", (_, res) => res.send("✅ Document Intelligence OCR backend running"));
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+app.listen(PORT, () => console.log("🚀 Server running on", PORT));
