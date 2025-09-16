@@ -1,160 +1,143 @@
-// index.js สำหรับ Cloudflare Workers
-export default {
-  async fetch(request, env, ctx) {
-    // ตรวจสอบ Environment Variables
-    const AZURE_ENDPOINT = (env.AZURE_VISION_ENDPOINT || "").replace(/\/+$/, "");
-    const AZURE_KEY = env.AZURE_VISION_KEY;
+// index.js — Cloudflare Worker (no Express/fs/multer)
 
-    if (!AZURE_ENDPOINT || !AZURE_KEY) {
-      return new Response(
-        JSON.stringify({ error: "Missing AZURE_VISION_ENDPOINT or AZURE_VISION_KEY" }), 
-        { status: 500, headers: { "Content-Type": "application/json" } }
-      );
+const API_VERSION = "2023-07-31";
+
+function extractText(diJson) {
+  const pages = diJson?.analyzeResult?.pages || [];
+  const lines = [];
+  for (const p of pages) {
+    for (const ln of p.lines || []) {
+      if (ln.content) lines.push(ln.content);
     }
+  }
+  return lines.join("\n").trim();
+}
 
-    // CORS headers
-    const corsHeaders = {
-      "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type",
-      "Content-Type": "application/json"
-    };
+async function pollResult(resultUrl, key) {
+  // Poll จนกว่าจะ "succeeded" หรือ "failed"
+  while (true) {
+    const r = await fetch(resultUrl, {
+      headers: { "Ocp-Apim-Subscription-Key": key }
+    });
+    const data = await r.json().catch(() => ({}));
+    if (data.status === "succeeded" || data.status === "failed") {
+      return data;
+    }
+    // รอ 1.5 วิ ก่อนถามอีกรอบ
+    await new Promise((res) => setTimeout(res, 1500));
+  }
+}
 
-    // Handle CORS preflight
+function withCors(body, init = {}, request) {
+  const origin = request.headers.get("Origin") || "*";
+  const headers = new Headers(init.headers || {});
+  headers.set("Access-Control-Allow-Origin", origin);
+  headers.set("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  headers.set("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  headers.set("Vary", "Origin");
+  return new Response(body, { ...init, headers });
+}
+
+function json(data, status = 200, request) {
+  return withCors(
+    JSON.stringify(data),
+    { status, headers: { "content-type": "application/json; charset=utf-8" } },
+    request
+  );
+}
+
+export default {
+  async fetch(request, env) {
+    // CORS preflight
     if (request.method === "OPTIONS") {
-      return new Response(null, { headers: corsHeaders });
+      return withCors(null, { status: 204 }, request);
     }
 
     const url = new URL(request.url);
-    const OCR_URL = `${AZURE_ENDPOINT}/formrecognizer/documentModels/prebuilt-read:analyze?api-version=2023-07-31`;
+    const path = url.pathname;
 
-    // ฟังก์ชันแยกข้อความจาก Azure Response
-    function extractText(diJson) {
-      const pages = diJson?.analyzeResult?.pages || [];
-      const lines = [];
-      for (const p of pages) {
-        for (const ln of p.lines || []) {
-          if (ln.content) lines.push(ln.content);
-        }
-      }
-      return lines.join("\\n").trim();
+    // ตรวจ env
+    const ENDPOINT = (env.AZURE_VISION_ENDPOINT || "").replace(/\/+$/, "");
+    const KEY = env.AZURE_VISION_KEY;
+    if (!ENDPOINT || !KEY) {
+      return json({ error: "Missing AZURE_VISION_ENDPOINT or AZURE_VISION_KEY" }, 500, request);
     }
 
-    // ฟังก์ชัน Polling สำหรับรอผลลัพธ์
-    async function pollResult(resultUrl) {
-      while (true) {
-        const r = await fetch(resultUrl, {
-          headers: { "Ocp-Apim-Subscription-Key": AZURE_KEY }
-        });
-        const data = await r.json();
+    const OCR_URL = `${ENDPOINT}/formrecognizer/documentModels/prebuilt-read:analyze?api-version=${API_VERSION}`;
 
-        if (data.status === "succeeded" || data.status === "failed") {
-          return data;
-        }
-        // รอ 1.5 วินาทีก่อน poll ครั้งต่อไป
-        await new Promise((resolve) => setTimeout(resolve, 1500));
-      }
+    // Root
+    if (path === "/" && request.method === "GET") {
+      return withCors("✅ OCR Worker running with polling", {
+        status: 200,
+        headers: { "content-type": "text/plain; charset=utf-8" }
+      }, request);
     }
 
-    try {
-      // Route: หน้าแรก
-      if (url.pathname === "/" && request.method === "GET") {
-        return new Response("✅ OCR Backend running on Cloudflare Workers with polling", {
-          headers: { "Content-Type": "text/plain", ...corsHeaders }
-        });
-      }
-
-      // Route: OCR จาก URL
-      if (url.pathname === "/ocr/url" && request.method === "POST") {
-        const body = await request.json();
-        const { imageUrl } = body || {};
-        
-        if (!imageUrl) {
-          return new Response(
-            JSON.stringify({ error: "imageUrl required" }), 
-            { status: 400, headers: corsHeaders }
-          );
-        }
+    // ---- OCR จาก URL ----
+    if (path === "/ocr/url" && request.method === "POST") {
+      try {
+        const { imageUrl } = await request.json().catch(() => ({}));
+        if (!imageUrl) return json({ error: "imageUrl required" }, 400, request);
 
         const r = await fetch(OCR_URL, {
           method: "POST",
           headers: {
-            "Ocp-Apim-Subscription-Key": AZURE_KEY,
+            "Ocp-Apim-Subscription-Key": KEY,
             "Content-Type": "application/json"
           },
           body: JSON.stringify({ urlSource: imageUrl })
         });
 
         if (!r.ok) {
-          const errorText = await r.text();
-          return new Response(errorText, { status: 400, headers: corsHeaders });
+          const txt = await r.text().catch(() => "");
+          return json({ error: "Azure initial request failed", detail: txt }, r.status, request);
         }
 
         const opLoc = r.headers.get("operation-location");
-        const data = await pollResult(opLoc);
+        if (!opLoc) return json({ error: "Missing operation-location header" }, 500, request);
 
-        return new Response(
-          JSON.stringify({ 
-            status: "succeeded", 
-            text: extractText(data), 
-            raw: data 
-          }), 
-          { headers: corsHeaders }
-        );
+        const data = await pollResult(opLoc, KEY);
+        return json({ status: data.status, text: extractText(data), raw: data }, 200, request);
+      } catch (e) {
+        return json({ error: String(e) }, 500, request);
       }
+    }
 
-      // Route: OCR จากไฟล์อัพโหลด
-      if (url.pathname === "/ocr/upload" && request.method === "POST") {
-        const formData = await request.formData();
-        const file = formData.get("file");
-        
-        if (!file) {
-          return new Response(
-            JSON.stringify({ error: "file required" }), 
-            { status: 400, headers: corsHeaders }
-          );
+    // ---- OCR จากไฟล์ (multipart/form-data, field: "file") ----
+    if (path === "/ocr/upload" && request.method === "POST") {
+      try {
+        const form = await request.formData();
+        const file = form.get("file");
+        if (!file || typeof file.arrayBuffer !== "function") {
+          return json({ error: "file required (multipart/form-data, field name 'file')" }, 400, request);
         }
 
-        const fileBuffer = await file.arrayBuffer();
+        const buf = await file.arrayBuffer();
 
         const r = await fetch(OCR_URL, {
           method: "POST",
           headers: {
-            "Ocp-Apim-Subscription-Key": AZURE_KEY,
+            "Ocp-Apim-Subscription-Key": KEY,
             "Content-Type": "application/octet-stream"
           },
-          body: fileBuffer
+          body: buf
         });
 
         if (!r.ok) {
-          const errorText = await r.text();
-          return new Response(errorText, { status: 400, headers: corsHeaders });
+          const txt = await r.text().catch(() => "");
+          return json({ error: "Azure initial upload failed", detail: txt }, r.status, request);
         }
 
         const opLoc = r.headers.get("operation-location");
-        const data = await pollResult(opLoc);
+        if (!opLoc) return json({ error: "Missing operation-location header" }, 500, request);
 
-        return new Response(
-          JSON.stringify({ 
-            status: "succeeded", 
-            text: extractText(data), 
-            raw: data 
-          }), 
-          { headers: corsHeaders }
-        );
+        const data = await pollResult(opLoc, KEY);
+        return json({ status: data.status, text: extractText(data), raw: data }, 200, request);
+      } catch (e) {
+        return json({ error: String(e) }, 500, request);
       }
-
-      // Route ไม่พบ
-      return new Response(
-        JSON.stringify({ error: "Route not found" }), 
-        { status: 404, headers: corsHeaders }
-      );
-
-    } catch (error) {
-      return new Response(
-        JSON.stringify({ error: String(error) }), 
-        { status: 500, headers: corsHeaders }
-      );
     }
+
+    return json({ error: "Not found" }, 404, request);
   }
 };
