@@ -1,0 +1,5 @@
+name = "your-worker-name"
+main = "index.js"
+compatibility_date = "2025-09-16"
+# ถ้าไม่มีการใช้โมดูล Node.js ไม่ต้องเปิด node_compat
+# node_compat = true
